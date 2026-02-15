@@ -12,7 +12,7 @@ const MAX_SPEED = 5;
 const DASH_SPEED = 18; 
 const DASH_COOLDOWN = 5000;
 const BULLET_SPEED = 16;
-const RELOAD_TIME = 1000; 
+const RELOAD_TIME = 400; // Iets sneller schieten voor betere gameplay
 const MAP_WIDTH = 2400;  
 const MAP_HEIGHT = 1800; 
 const BULLET_LIFESPAN = 1500; 
@@ -32,6 +32,26 @@ const OBSTACLES = [
   { x: 700, y: 1400, w: 100, h: 100 },
   { x: 1600, y: 1400, w: 100, h: 100 },
 ];
+
+// Helper om te checken of een punt in een obstakel zit
+function isInObstacle(x, y, margin = 40) {
+  return OBSTACLES.some(o => 
+    x > o.x - margin && x < o.x + o.w + margin &&
+    y > o.y - margin && y < o.y + o.h + margin
+  );
+}
+
+// Zoek een veilige spawnplek
+function findSafeSpawn() {
+  let attempts = 0;
+  while (attempts < 100) {
+    const x = Math.random() * (MAP_WIDTH - 200) + 100;
+    const y = Math.random() * (MAP_HEIGHT - 200) + 100;
+    if (!isInObstacle(x, y)) return { x, y };
+    attempts++;
+  }
+  return { x: 1200, y: 900 }; // Fallback
+}
 
 export default function App() {
   const [socket, setSocket] = useState(null);
@@ -54,12 +74,11 @@ export default function App() {
   const frameRef = useRef();
   const deathIntervalRef = useRef();
 
-  // Houd gameStateRef up-to-date zodat de socket listener de huidige status weet
   useEffect(() => {
     gameStateRef.current = gameState;
   }, [gameState]);
 
-  // 1. Socket Verbinding (Draait maar 1 keer!)
+  // 1. Socket Verbinding
   useEffect(() => {
     const s = io(SERVER_URL);
     setSocket(s);
@@ -67,21 +86,30 @@ export default function App() {
     s.on('lobbyUpdate', (data) => {
       setLobbyData(data);
       
-      // Als de server zegt dat we spelen, en we zitten in de lobby: START!
+      // START SPEL LOGICA
       if (data.status === 'PLAYING' && gameStateRef.current === 'LOBBY') {
         const myData = data.players[s.id];
-        if (myData) {
-          pos.current = { x: myData.x, y: myData.y };
-          vel.current = { x: 0, y: 0 };
-          setGameState('PLAYING');
+        // Gebruik server positie, OF zoek zelf een veilige plek als de server ons in een muur zet
+        let startX = myData ? myData.x : 1200;
+        let startY = myData ? myData.y : 900;
+
+        if (isInObstacle(startX, startY)) {
+           const safe = findSafeSpawn();
+           startX = safe.x;
+           startY = safe.y;
+           // Stuur correctie naar server
+           s.emit('move', { x: startX, y: startY });
         }
+
+        pos.current = { x: startX, y: startY };
+        vel.current = { x: 0, y: 0 };
+        setGameState('PLAYING');
       }
 
       if (data.winner) setGameState('WINNER');
 
-      // Check of ik dood ben
       if (gameStateRef.current === 'PLAYING' && data.players[s.id]?.alive === false) {
-        startDeathSequence(s); // Geef socket mee
+        startDeathSequence(s);
       }
     });
 
@@ -94,7 +122,7 @@ export default function App() {
       s.disconnect();
       window.removeEventListener('resize', handleResize);
     };
-  }, []); // Lege array = maar 1 keer uitvoeren
+  }, []); 
 
   // 2. Game Loop
   useEffect(() => {
@@ -121,7 +149,13 @@ export default function App() {
       setDeathTimer(prev => {
         if (prev <= 1) {
           clearInterval(deathIntervalRef.current);
+          
+          // Respawn op veilige plek
+          const safe = findSafeSpawn();
+          pos.current = safe;
+          currentSocket.emit('move', safe); // Sync positie
           currentSocket.emit('respawn');
+          
           setGameState('PLAYING');
           return 0;
         }
@@ -130,10 +164,32 @@ export default function App() {
     }, 1000);
   };
 
+  const performShoot = () => {
+      if (Date.now() - lastShotTime.current < RELOAD_TIME) return;
+
+      const camX = pos.current.x - screenSize.w / 2;
+      const camY = pos.current.y - screenSize.h / 2;
+      const worldMouseX = mousePosScreen.current.x + camX;
+      const worldMouseY = mousePosScreen.current.y + camY;
+      
+      const bdx = worldMouseX - pos.current.x;
+      const bdy = worldMouseY - pos.current.y;
+      const bdist = Math.sqrt(bdx*bdx + bdy*bdy);
+      
+      if (bdist > 1) {
+        socket.emit('shoot', {
+          x: pos.current.x,
+          y: pos.current.y,
+          vx: (bdx / bdist) * BULLET_SPEED,
+          vy: (bdy / bdist) * BULLET_SPEED
+        });
+        lastShotTime.current = Date.now();
+      }
+  };
+
   const updatePhysics = () => {
     if (!socket || !lobbyData) return;
-    // ... (rest van physics code identiek aan voorheen, maar let op dat je 'pos' en 'vel' correct gebruikt)
-    // Ik neem de physics code exact over van je input
+
     const centerX = screenSize.w / 2;
     const centerY = screenSize.h / 2;
     const dx = mousePosScreen.current.x - centerX;
@@ -156,52 +212,40 @@ export default function App() {
     vel.current.x *= FRICTION;
     vel.current.y *= FRICTION;
 
+    // Snelheidslimiet
     const speed = Math.sqrt(vel.current.x**2 + vel.current.y**2);
     const cap = (Date.now() - lastDashTime.current < 300) ? DASH_SPEED : MAX_SPEED;
-    
     if (speed > cap) {
       vel.current.x = (vel.current.x / speed) * cap;
       vel.current.y = (vel.current.y / speed) * cap;
     }
 
+    // Nieuwe positie berekenen
     let nextX = pos.current.x + vel.current.x;
     let nextY = pos.current.y + vel.current.y;
     const r = 20;
 
+    // Map grenzen
     if (nextX < r) nextX = r; if (nextX > MAP_WIDTH - r) nextX = MAP_WIDTH - r;
     if (nextY < r) nextY = r; if (nextY > MAP_HEIGHT - r) nextY = MAP_HEIGHT - r;
 
-    let hitX = false;
-    for (let obs of OBSTACLES) {
-      if (nextX + r > obs.x && nextX - r < obs.x + obs.w && pos.current.y + r > obs.y && pos.current.y - r < obs.y + obs.h) hitX = true;
+    // Obstakel botsing (X-as)
+    if (!isInObstacle(nextX, pos.current.y, r)) {
+        pos.current.x = nextX;
+    } else {
+        vel.current.x *= 0.5; // Stuiteren
     }
-    if (!hitX) pos.current.x = nextX; else vel.current.x *= 0.5;
 
-    let hitY = false;
-    for (let obs of OBSTACLES) {
-      if (pos.current.x + r > obs.x && pos.current.x - r < obs.x + obs.w && nextY + r > obs.y && nextY - r < obs.y + obs.h) hitY = true;
+    // Obstakel botsing (Y-as)
+    if (!isInObstacle(pos.current.x, nextY, r)) {
+        pos.current.y = nextY;
+    } else {
+        vel.current.y *= 0.5; // Stuiteren
     }
-    if (!hitY) pos.current.y = nextY; else vel.current.y *= 0.5;
 
-    if (keysPressed.current[' '] && Date.now() - lastShotTime.current > RELOAD_TIME) {
-      const camX = pos.current.x - screenSize.w / 2;
-      const camY = pos.current.y - screenSize.h / 2;
-      const worldMouseX = mousePosScreen.current.x + camX;
-      const worldMouseY = mousePosScreen.current.y + camY;
-      
-      const bdx = worldMouseX - pos.current.x;
-      const bdy = worldMouseY - pos.current.y;
-      const bdist = Math.sqrt(bdx*bdx + bdy*bdy);
-      
-      if (bdist > 1) {
-        socket.emit('shoot', {
-          x: pos.current.x,
-          y: pos.current.y,
-          vx: (bdx / bdist) * BULLET_SPEED,
-          vy: (bdy / bdist) * BULLET_SPEED
-        });
-        lastShotTime.current = Date.now();
-      }
+    // Schieten met Spatie (optioneel)
+    if (keysPressed.current[' ']) {
+        performShoot();
     }
 
     socket.emit('move', { x: pos.current.x, y: pos.current.y });
@@ -220,6 +264,7 @@ export default function App() {
     ctx.save();
     ctx.translate(-camX, -camY);
 
+    // Raster
     ctx.strokeStyle = '#1e293b';
     ctx.lineWidth = 2;
     ctx.beginPath();
@@ -227,6 +272,7 @@ export default function App() {
     for (let y = 0; y <= MAP_HEIGHT; y += 100) { ctx.moveTo(0, y); ctx.lineTo(MAP_WIDTH, y); }
     ctx.stroke();
 
+    // Obstakels
     ctx.fillStyle = '#334155';
     ctx.strokeStyle = '#64748b';
     ctx.lineWidth = 4;
@@ -235,6 +281,7 @@ export default function App() {
       ctx.strokeRect(o.x, o.y, o.w, o.h);
     });
 
+    // Kogels
     const now = Date.now();
     ctx.fillStyle = '#fbbf24';
     ctx.shadowBlur = 10;
@@ -251,6 +298,7 @@ export default function App() {
     });
     ctx.shadowBlur = 0;
 
+    // Spelers
     Object.entries(lobbyData?.players || {}).forEach(([id, p]) => {
       if (!p.alive) return;
       const isMe = id === socket.id;
@@ -278,6 +326,7 @@ export default function App() {
       }
     });
 
+    // Balkjes (Reload & Dash)
     const timeSinceShot = now - lastShotTime.current;
     if (timeSinceShot < RELOAD_TIME) {
       const pct = timeSinceShot / RELOAD_TIME;
@@ -297,6 +346,24 @@ export default function App() {
     }
     ctx.restore();
 
+    // --- CROSSHAIR TEKENEN ---
+    const mx = mousePosScreen.current.x;
+    const my = mousePosScreen.current.y;
+    
+    // Cirkel
+    ctx.strokeStyle = '#10b981'; // Emerald groen
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(mx, my, 12, 0, Math.PI * 2);
+    ctx.stroke();
+
+    // Dot in midden
+    ctx.fillStyle = '#10b981';
+    ctx.beginPath();
+    ctx.arc(mx, my, 2, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Minimap
     const mmScale = 0.08;
     const mmW = MAP_WIDTH * mmScale;
     const mmH = MAP_HEIGHT * mmScale;
@@ -321,7 +388,7 @@ export default function App() {
     ctx.fillStyle = 'rgba(255,255,255,0.5)';
     ctx.font = '12px sans-serif';
     ctx.textAlign = 'left';
-    ctx.fillText("SPATIE = Schieten | SHIFT = Dash", 20, screenSize.h - 20);
+    ctx.fillText("KLIK = Schieten | SHIFT = Dash", 20, screenSize.h - 20);
   };
 
   const join = () => {
@@ -334,8 +401,6 @@ export default function App() {
     socket.emit('startMatch');
   };
 
-  // --- UI ---
-  // (Identiek aan je input, maar check 'join' button en 'startMatch' button)
   if (gameState === 'MENU') return (
     <div className="w-full h-screen bg-slate-950 flex items-center justify-center text-white font-sans overflow-hidden">
       <div className="bg-slate-900 p-12 rounded-[3rem] shadow-2xl w-full max-w-sm border-b-8 border-emerald-500/20 text-center">
@@ -368,7 +433,6 @@ export default function App() {
     </div>
   );
 
-  // ... (rest van UI voor WINNER en return canvas)
   if (gameState === 'WINNER') return (
     <div className="fixed inset-0 bg-slate-950 flex items-center justify-center z-[200] text-white">
         <div className="text-center">
@@ -387,6 +451,7 @@ export default function App() {
         width={screenSize.w}
         height={screenSize.h}
         onMouseMove={e => mousePosScreen.current = { x: e.clientX, y: e.clientY }}
+        onMouseDown={performShoot} // KLIK OM TE SCHIETEN TOEGEVOEGD
       />
       <div className="absolute top-4 left-4 bg-black/40 p-4 rounded-xl backdrop-blur-sm border border-white/10 text-white pointer-events-none select-none">
          <h3 className="font-bold text-xs uppercase text-slate-400 mb-2 italic">Top Spelers</h3>
