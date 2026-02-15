@@ -57,7 +57,7 @@ export default function App() {
 
   // Socket initialisatie
   useEffect(() => {
-    const s = io("https://mountains-invision-pace-combining.trycloudflare.com"); // Verbinding met de Pi via de huidige URL
+    const s = io("https://recorded-treatment-plasma-televisions.trycloudflare.com "); // Verbinding met de Pi via de huidige URL
     setSocket(s);
 
     s.on('lobbyUpdate', (data) => {
