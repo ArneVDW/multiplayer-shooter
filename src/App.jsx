@@ -1,7 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { io } from 'socket.io-client';
 import { Skull, Crosshair, Trophy, Play } from 'lucide-react';
-import './index.css';
 
 // --- CONFIGURATIE ---
 const SERVER_URL = "https://chapters-episodes-publications-jewish.trycloudflare.com";
@@ -13,7 +12,7 @@ const MAX_SPEED = 5;
 const DASH_SPEED = 18; 
 const DASH_COOLDOWN = 5000;
 const BULLET_SPEED = 16;
-const RELOAD_TIME = 400; // Iets sneller schieten voor betere gameplay
+const RELOAD_TIME = 400;
 const MAP_WIDTH = 2400;  
 const MAP_HEIGHT = 1800; 
 const BULLET_LIFESPAN = 1500; 
@@ -74,6 +73,7 @@ export default function App() {
   const lastDashTime = useRef(0);
   const frameRef = useRef();
   const deathIntervalRef = useRef();
+  const lastRespawnTime = useRef(0);
 
   useEffect(() => {
     gameStateRef.current = gameState;
@@ -88,30 +88,37 @@ export default function App() {
       setLobbyData(data);
       
       // START SPEL LOGICA
-      if (data.status === 'PLAYING' && gameStateRef.current === 'LOBBY') {
-        const myData = data.players[s.id];
-        // Gebruik server positie, OF zoek zelf een veilige plek als de server ons in een muur zet
-        let startX = myData ? myData.x : 1200;
-        let startY = myData ? myData.y : 900;
+      if (data.status === 'PLAYING') {
+        
+        // Initiele Spawn
+        if (gameStateRef.current === 'LOBBY') {
+          const myData = data.players[s.id];
+          let startX = myData ? myData.x : 1200;
+          let startY = myData ? myData.y : 900;
 
-        if (isInObstacle(startX, startY)) {
-           const safe = findSafeSpawn();
-           startX = safe.x;
-           startY = safe.y;
-           // Stuur correctie naar server
-           s.emit('move', { x: startX, y: startY });
+          if (isInObstacle(startX, startY)) {
+             const safe = findSafeSpawn();
+             startX = safe.x;
+             startY = safe.y;
+             s.emit('move', { x: startX, y: startY });
+          }
+
+          pos.current = { x: startX, y: startY };
+          vel.current = { x: 0, y: 0 };
+          setGameState('PLAYING');
         }
 
-        pos.current = { x: startX, y: startY };
-        vel.current = { x: 0, y: 0 };
-        setGameState('PLAYING');
+        // Check voor eliminatie (Met FIX: negeer eliminaties tot 2 seconden ná respawnen)
+        const myData = data.players[s.id];
+        if (gameStateRef.current === 'PLAYING' && myData?.alive === false) {
+          if (Date.now() - lastRespawnTime.current > 2000) {
+            startDeathSequence(s);
+          }
+        }
+
       }
 
       if (data.winner) setGameState('WINNER');
-
-      if (gameStateRef.current === 'PLAYING' && data.players[s.id]?.alive === false) {
-        startDeathSequence(s);
-      }
     });
 
     const handleResize = () => setScreenSize({ w: window.innerWidth, h: window.innerHeight });
@@ -127,10 +134,12 @@ export default function App() {
 
   // 2. Game Loop
   useEffect(() => {
-    if (gameState !== 'PLAYING') return;
+    if (gameState !== 'PLAYING' && gameState !== 'DEAD') return;
 
     const render = () => {
-      updatePhysics();
+      if (gameStateRef.current === 'PLAYING') {
+        updatePhysics();
+      }
       draw();
       frameRef.current = requestAnimationFrame(render);
     };
@@ -154,9 +163,10 @@ export default function App() {
           // Respawn op veilige plek
           const safe = findSafeSpawn();
           pos.current = safe;
-          currentSocket.emit('move', safe); // Sync positie
+          currentSocket.emit('move', safe);
           currentSocket.emit('respawn');
           
+          lastRespawnTime.current = Date.now();
           setGameState('PLAYING');
           return 0;
         }
@@ -166,6 +176,7 @@ export default function App() {
   };
 
   const performShoot = () => {
+      if (gameStateRef.current !== 'PLAYING') return;
       if (Date.now() - lastShotTime.current < RELOAD_TIME) return;
 
       const camX = pos.current.x - screenSize.w / 2;
@@ -283,19 +294,13 @@ export default function App() {
     });
 
     // Kogels
-    const now = Date.now();
     ctx.fillStyle = '#fbbf24';
     ctx.shadowBlur = 10;
     ctx.shadowColor = '#fbbf24';
     lobbyData?.bullets?.forEach(b => {
-      const age = (now - b.createdAt) / 1000;
-      if (age < BULLET_LIFESPAN / 1000) {
-        const bx = b.x + b.vx * age * 60;
-        const by = b.y + b.vy * age * 60;
-        ctx.beginPath();
-        ctx.arc(bx, by, 5, 0, Math.PI * 2);
-        ctx.fill();
-      }
+      ctx.beginPath();
+      ctx.arc(b.x, b.y, 5, 0, Math.PI * 2); 
+      ctx.fill();
     });
     ctx.shadowBlur = 0;
 
@@ -328,8 +333,9 @@ export default function App() {
     });
 
     // Balkjes (Reload & Dash)
+    const now = Date.now();
     const timeSinceShot = now - lastShotTime.current;
-    if (timeSinceShot < RELOAD_TIME) {
+    if (timeSinceShot < RELOAD_TIME && gameStateRef.current === 'PLAYING') {
       const pct = timeSinceShot / RELOAD_TIME;
       ctx.fillStyle = '#334155';
       ctx.fillRect(pos.current.x - 20, pos.current.y + 30, 40, 4);
@@ -338,7 +344,7 @@ export default function App() {
     }
 
     const timeSinceDash = now - lastDashTime.current;
-    if (timeSinceDash < DASH_COOLDOWN) {
+    if (timeSinceDash < DASH_COOLDOWN && gameStateRef.current === 'PLAYING') {
       const pct = timeSinceDash / DASH_COOLDOWN;
       ctx.fillStyle = '#1e3a8a';
       ctx.fillRect(pos.current.x - 20, pos.current.y + 36, 40, 4);
@@ -348,21 +354,23 @@ export default function App() {
     ctx.restore();
 
     // --- CROSSHAIR TEKENEN ---
-    const mx = mousePosScreen.current.x;
-    const my = mousePosScreen.current.y;
-    
-    // Cirkel
-    ctx.strokeStyle = '#10b981'; // Emerald groen
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.arc(mx, my, 12, 0, Math.PI * 2);
-    ctx.stroke();
+    if (gameStateRef.current === 'PLAYING') {
+      const mx = mousePosScreen.current.x;
+      const my = mousePosScreen.current.y;
+      
+      // Cirkel
+      ctx.strokeStyle = '#10b981'; 
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(mx, my, 12, 0, Math.PI * 2);
+      ctx.stroke();
 
-    // Dot in midden
-    ctx.fillStyle = '#10b981';
-    ctx.beginPath();
-    ctx.arc(mx, my, 2, 0, Math.PI * 2);
-    ctx.fill();
+      // Dot in midden
+      ctx.fillStyle = '#10b981';
+      ctx.beginPath();
+      ctx.arc(mx, my, 2, 0, Math.PI * 2);
+      ctx.fill();
+    }
 
     // Minimap
     const mmScale = 0.08;
@@ -452,8 +460,9 @@ export default function App() {
         width={screenSize.w}
         height={screenSize.h}
         onMouseMove={e => mousePosScreen.current = { x: e.clientX, y: e.clientY }}
-        onMouseDown={performShoot} // KLIK OM TE SCHIETEN TOEGEVOEGD
+        onMouseDown={performShoot}
       />
+      
       <div className="absolute top-4 left-4 bg-black/40 p-4 rounded-xl backdrop-blur-sm border border-white/10 text-white pointer-events-none select-none">
          <h3 className="font-bold text-xs uppercase text-slate-400 mb-2 italic">Top Spelers</h3>
          {Object.values(lobbyData?.players || {})
